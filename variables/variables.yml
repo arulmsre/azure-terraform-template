@@ -1,0 +1,2 @@
+variables:
+    spring-petclinic-microservices: petclinicapp

@@ -1,0 +1,291 @@
+trigger: none
+pr: none
+
+schedules:
+- cron: "0 2 * * *"
+  displayName: Daily midnight build
+  branches:
+    include:
+      - main
+  always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+- name: 'deployACR'
+  displayName: Deploy ACR
+  default: true
+  type: boolean
+
+- name: 'appToDeploy'
+  displayName: Apps to Deploy
+  type: 'string'
+  default: 'spring-petclinic-microservices'
+  values:
+    - spring-petclinic-microservices
+
+- name: updateDBLF
+  displayName: "Update DBLF to Latest Version"
+  type: 'boolean'
+  default: false
+
+- name: DBLFFolder
+  displayName: "Source Folder for DBLF (if updating)"
+  type: string
+  default: "agents"
+
+- name: 'removeOnly'
+  displayName: Remove Resources Only
+  type: 'boolean'
+  default: false
+
+- name: 'applicationBranch'
+  displayName: Application Branch to Deploy
+  type: string 
+  default: 'main'
+
+- name: 'jdkVersion'
+  displayName: Java Maven Version
+  type: string
+  default: 1.17
+  values:
+    - 1.17
+    - 1.11
+    - 1.10
+    - 1.9
+    - 1.8
+
+resources:
+  repositories:
+    - repository: cloud-sre-demo-applications
+      name: cloud-sre-demo-applications
+      ref: ${{parameters.applicationBranch}}
+      type: git
+    - repository: dynamic-binded-logging-framework
+      name: dynamic-binded-logging-framework
+      ref: refs/heads/main
+      type: git
+
+variables:
+- template: ./variables/variables.yml
+
+stages:
+- stage:
+  condition: and(succeeded(),not(eq(variables['Build.Reason'],'schedule')),eq(${{parameters.removeOnly}},false))
+  displayName: 'Deploy Terraform Resources'
+  jobs:
+  - job: Build_and_Deploy_App
+    displayName: 'Build and Deploy ${{parameters.appToDeploy}}'
+    steps:
+    - checkout: cloud-sre-demo-applications
+    - checkout: self
+    - ${{if eq(parameters.updateDBLF, 'True')}}:
+      - checkout: dynamic-binded-logging-framework
+    - task: Maven@4
+      displayName: Build DBLF
+      condition: ${{parameters.updateDBLF}}
+      inputs:
+        mavenPOMFile: '$(Build.SourcesDirectory)/dynamic-binded-logging-framework/pom.xml' # string. Required. Maven POM file. Default: pom.xml.
+        goals: 'clean package' # string. Goal(s). Default: package.
+        options: '-DskipTests' # string. Options. 
+        javaHomeOption: 'JDKVersion' # 'JDKVersion' | 'Path'. Alias: javaHomeSelection. Required. Set JAVA_HOME by. Default: JDKVersion.
+        jdkVersionOption: '${{parameters.jdkVersion}}' # 'default' | '1.17' | '1.11' | '1.10' | '1.9' | '1.8' | '1.7' | '1.6'. Alias: jdkVersion. Optional. Use when javaHomeSelection = JDKVersion. JDK version. Default: default.
+        mavenVersionOption: 'Default' # 'Default' | 'Path'. Alias: mavenVersionSelection. Required. Maven version. Default: Default.
+    - task: PowerShell@2
+      condition: and(succeeded(),${{parameters.updateDBLF}})
+      displayName: Copy DBLF JAR to App Directory '${{parameters.DBLFFolder}}' folder.
+      inputs:
+        targetType: inline  
+        script: | 
+          Write-Output "Getting DBLF JAR.."
+          Write-Output "DBLF Directory:"
+          Get-Item -Path $(Build.SourcesDirectory)/dynamic-binded-logging-framework/target/dynamic-binded-logging-framework-*.jar
+          Write-Output "Target Directory:"
+          Get-Item -Path $(Build.SourcesDirectory)/cloud-sre-demo-applications/${{parameters.appToDeploy}}/${{parameters.DBLFFolder}}/*
+          Write-Output "Overriding file in directory...."
+          Copy-Item -Path "$(Build.SourcesDirectory)/dynamic-binded-logging-framework/target/dynamic-binded-logging-framework-*.jar" -Destination "$(Build.SourcesDirectory)/cloud-sre-demo-applications/${{parameters.appToDeploy}}/${{parameters.DBLFFolder}}/dynamic-binded-logging-framework.jar"  -Force
+          Write-Output "Directory after update:"
+          Get-Item -Path $(Build.SourcesDirectory)/cloud-sre-demo-applications/${{parameters.appToDeploy}}/${{parameters.DBLFFolder}}/*
+    
+    # - template: './${{parameters.appToDeploy}}/.pipelines/build.yml@cloud-sre-demo-applications'
+    #   parameters:
+    #     currentDirectory: $(Build.SourcesDirectory)/cloud-sre-demo-applications
+    
+    - task: Maven@4
+      displayName: Maven build
+      inputs:
+        mavenPOMFile: '$(Build.SourcesDirectory)/cloud-sre-demo-applications/${{parameters.appToDeploy}}/pom.xml' # string. Required. Maven POM file. Default: pom.xml.
+        goals: 'clean install -P buildDocker' # string. Goal(s). Default: package.
+        options: '-DskipTests' # string. Options. 
+        javaHomeOption: 'JDKVersion' # 'JDKVersion' | 'Path'. Alias: javaHomeSelection. Required. Set JAVA_HOME by. Default: JDKVersion.
+        jdkVersionOption: '${{parameters.jdkVersion}}' # 'default' | '1.17' | '1.11' | '1.10' | '1.9' | '1.8' | '1.7' | '1.6'. Alias: jdkVersion. Optional. Use when javaHomeSelection = JDKVersion. JDK version. Default: default.
+        mavenVersionOption: 'Default' # 'Default' | 'Path'. Alias: mavenVersionSelection. Required. Maven version. Default: Default.
+      
+    - task: Bash@3
+      displayName: Install Terraform
+      condition: succeeded()
+      inputs:
+        targetType: 'inline'
+        script: |
+            sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
+            wget -O- https://apt.releases.hashicorp.com/gpg | \
+            gpg --dearmor | \
+            sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+            gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg \
+            --fingerprint
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+            sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update
+            sudo apt-get install terraform
+            terraform --version
+    - task: AzureCLI@2
+      condition: and(succeeded(),${{parameters.deployACR}})
+      displayName: Deploy ACR Using Terraform
+      inputs:
+        azureSubscription: 'SRE-ASSETS-DEMO-SC' # string. Alias: connectedServiceNameARM. Required. Azure Resource Manager connection. 
+        scriptType: 'bash' # 'ps' | 'pscore' | 'batch' | 'bash'. Required. Script Type. 
+        scriptLocation: 'inlineScript' # 'inlineScript' | 'scriptPath'. Required. Script Location. Default: scriptPath.
+        #scriptPath: # string. Required when scriptLocation = scriptPath. Script Path. 
+        inlineScript: |
+          terraform init
+          terraform validate
+          terraform plan -out=plan.tfplan -input=false
+          terraform apply -input=false -auto-approve plan.tfplan
+        # string. Required when scriptLocation = inlineScript. Inline Script. 
+        #arguments: # string. Alias: scriptArguments. Script Arguments. 
+        #powerShellErrorActionPreference: 'stop' # 'stop' | 'continue' | 'silentlyContinue'. Optional. Use when scriptType = ps || scriptType = pscore. ErrorActionPreference. Default: stop.
+      # Advanced
+        #addSpnToEnvironment: false # boolean. Access service principal details in script. Default: false.
+        #useGlobalConfig: false # boolean. Use global Azure CLI configuration. Default: false.
+        workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)/terraform/modules/az-container-registry # string. Alias: cwd. Working Directory. 
+        #failOnStandardError: false # boolean. Fail on Standard Error. Default: false.
+        #powerShellIgnoreLASTEXITCODE: false # boolean. Optional. Use when scriptType = ps || scriptType = pscore. Ignore $LASTEXITCODE. Default: false.
+    
+    
+    - task: DockerCompose@1
+      condition: succeeded()
+      displayName: Deploy Docker Images to ACR
+      inputs:
+        containerregistrytype: 'Azure Container Registry' # 'Azure Container Registry' | 'Container Registry'. Required. Container Registry Type. Default: Azure Container Registry.
+        #dockerRegistryEndpoint: # string. Optional. Use when containerregistrytype = Container Registry. Docker Registry Service Connection. 
+        azureSubscription: 'SRE-ASSETS-DEMO-SC' # string. Alias: azureSubscriptionEndpoint. Optional. Use when containerregistrytype = Azure Container Registry. Azure subscription. 
+        azureContainerRegistry: 'capgeminisreeastusacr.azurecr.io' # string. Optional. Use when containerregistrytype = Azure Container Registry. Azure Container Registry. 
+        dockerComposeFile: '$(Build.SourcesDirectory)/cloud-sre-demo-applications/${{parameters.appToDeploy}}/docker-compose.yml' # string. Required. Docker Compose File. Default: **/docker-compose.yml.
+        #additionalDockerComposeFiles: # string. Additional Docker Compose Files. 
+        #dockerComposeFileArgs: # string. Environment Variables. 
+        #projectName: '$(Build.Repository.Name)' # string. Project Name. Default: $(Build.Repository.Name).
+        #qualifyImageNames: true # boolean. Qualify Image Names. Default: true.
+        action: 'Push services' # 'Build services' | 'Push services' | 'Run services' | 'Run a specific service' | 'Lock services' | 'Write service image digests' | 'Combine configuration' | 'Run a Docker Compose command'. Required. Action. Default: Run a Docker Compose command.
+        #additionalImageTags: # string. Optional. Use when action = Build services || action = Push services. Additional Image Tags. 
+        #includeSourceTags: false # boolean. Optional. Use when action = Build services || action = Push services. Include Source Tags. Default: false.
+        includeLatestTag: true # boolean. Optional. Use when action = Build services || action = Push services. Include Latest Tag. Default: false.
+        #buildImages: true # boolean. Optional. Use when action = Run services. Build Images. Default: true.
+        #serviceName: # string. Required when action = Run a specific service. Service Name. 
+        #containerName: # string. Optional. Use when action = Run a specific service. Container Name. 
+        #ports: # string. Optional. Use when action = Run a specific service. Ports. 
+        #workingDirectory: # string. Alias: workDir. Optional. Use when action = Run a specific service. Working Directory. 
+        #entrypoint: # string. Optional. Use when action = Run a specific service. Entry Point Override. 
+        #containerCommand: # string. Optional. Use when action = Run a specific service. Command. 
+        #detached: true # boolean. Optional. Use when action = Run services || action = Run a specific service. Run in Background. Default: true.
+        #abortOnContainerExit: true # boolean. Optional. Use when action = Run services && detached == false. Abort on Container Exit. Default: true.
+        #imageDigestComposeFile: '$(Build.StagingDirectory)/docker-compose.images.yml' # string. Required when action = Write service image digests. Image Digest Compose File. Default: $(Build.StagingDirectory)/docker-compose.images.yml.
+        #removeBuildOptions: false # boolean. Optional. Use when action = Lock services || action = Combine configuration. Remove Build Options. Default: false.
+        #baseResolveDirectory: # string. Optional. Use when action = Lock services || action = Combine configuration. Base Resolve Directory. 
+        #outputDockerComposeFile: '$(Build.StagingDirectory)/docker-compose.yml' # string. Required when action = Lock services || action = Combine configuration. Output Docker Compose File. Default: $(Build.StagingDirectory)/docker-compose.yml.
+        #dockerComposeCommand: # string. Required when action = Run a Docker Compose command. Command. 
+        #arguments: # string. Optional. Use when action != Lock services && action != Combine configuration && action != Write service image digests. Arguments. 
+      # Advanced Options
+        #dockerHostEndpoint: # string. Docker Host Service Connection. 
+        #nopIfNoDockerComposeFile: false # boolean. No-op if no Docker Compose File. Default: false.
+        #requireAdditionalDockerComposeFiles: false # boolean. Require Additional Docker Compose Files. Default: false.
+        currentWorkingDirectory: '$(Build.SourcesDirectory)/cloud-sre-demo-applications/${{parameters.appToDeploy}}' # string. Alias: cwd. Working Directory. Default: $(System.DefaultWorkingDirectory).
+        #dockerComposePath: # string. Docker Compose executable Path.
+    - task: AzureCLI@2
+      name: Deploy_TF
+      condition: succeeded()
+      displayName: Deploy ${{parameters.appToDeploy}} Resources Using Terraform
+      inputs:
+        azureSubscription: 'SRE-ASSETS-DEMO-SC' # string. Alias: connectedServiceNameARM. Required. Azure Resource Manager connection. 
+        scriptType: 'bash' # 'ps' | 'pscore' | 'batch' | 'bash'. Required. Script Type. 
+        scriptLocation: 'inlineScript' # 'inlineScript' | 'scriptPath'. Required. Script Location. Default: scriptPath.
+        #scriptPath: # string. Required when scriptLocation = scriptPath. Script Path. 
+        inlineScript: |
+         terraform init -upgrade
+         terraform validate
+         terraform plan -out=plan.tfplan -input=false
+         Write-Output "##vso[task.setvariable variable=TFDeploy;]True"
+         terraform apply -input=false -auto-approve plan.tfplan
+        # string. Required when scriptLocation = inlineScript. Inline Script. 
+        #arguments: # string. Alias: scriptArguments. Script Arguments. 
+        #powerShellErrorActionPreference: 'stop' # 'stop' | 'continue' | 'silentlyContinue'. Optional. Use when scriptType = ps || scriptType = pscore. ErrorActionPreference. Default: stop.
+      # Advanced
+        #addSpnToEnvironment: false # boolean. Access service principal details in script. Default: false.
+        #useGlobalConfig: false # boolean. Use global Azure CLI configuration. Default: false.
+        workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)/terraform/deployments/deploy-$(${{parameters.appToDeploy}}) # string. Alias: cwd. Working Directory. 
+        #failOnStandardError: false # boolean. Fail on Standard Error. Default: false.
+        #powerShellIgnoreLASTEXITCODE: false # boolean. Optional. Use when scriptType = ps || scriptType = pscore. Ignore $LASTEXITCODE. Default: false.
+    
+    - task: AzureCLI@2
+      condition: and(failed(), eq(variables['TFDeploy'], 'True'))
+      displayName: Destroy ${{parameters.appToDeploy}} Resources (Due to Error)
+      inputs:
+        azureSubscription: 'SRE-ASSETS-DEMO-SC' # string. Alias: connectedServiceNameARM. Required. Azure Resource Manager connection. 
+        scriptType: 'bash' # 'ps' | 'pscore' | 'batch' | 'bash'. Required. Script Type. 
+        scriptLocation: 'inlineScript' # 'inlineScript' | 'scriptPath'. Required. Script Location. Default: scriptPath.
+        #scriptPath: # string. Required when scriptLocation = scriptPath. Script Path. 
+        inlineScript: |
+         terraform destroy -input=false -auto-approve
+        # string. Required when scriptLocation = inlineScript. Inline Script. 
+        #arguments: # string. Alias: scriptArguments. Script Arguments. 
+        #powerShellErrorActionPreference: 'stop' # 'stop' | 'continue' | 'silentlyContinue'. Optional. Use when scriptType = ps || scriptType = pscore. ErrorActionPreference. Default: stop.
+      # Advanced
+        #addSpnToEnvironment: false # boolean. Access service principal details in script. Default: false.
+        #useGlobalConfig: false # boolean. Use global Azure CLI configuration. Default: false.
+        workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)/terraform/deployments/deploy-$(${{parameters.appToDeploy}}) # string. Alias: cwd. Working Directory. 
+        #failOnStandardError: false # boolean. Fail on Standard Error. Default: false.
+        #powerShellIgnoreLASTEXITCODE: false # boolean. Optional. Use when scriptType = ps || scriptType = pscore. Ignore $LASTEXITCODE. Default: false.
+- stage:
+  condition: or(and(not(eq(variables['Build.Reason'],'schedule')),succeededOrFailed()),${{parameters.removeOnly}})
+  displayName: 'Destroy AZ Resources by Approval'
+  jobs:
+    # track deployments on the environment
+  - deployment: RemoveResources
+    displayName: Remove All AZ Resources
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'REMOVE'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+           - checkout: self
+           - task: AzurePowerShell@5
+             displayName: Remove All Resources
+             inputs:
+              azurePowerShellVersion: LatestVersion
+              azureSubscription: 'SRE-ASSETS-DEMO-SC' # string. Alias: connectedServiceNameARM. Required. Azure Resource Manager connection. 
+              ScriptType: InlineScript
+              Inline: |
+                 $removeResourcesURI = "$(Build.SourcesDirectory)/.pipelines/templates/removeallresources.json"
+                 New-AzResourceGroupDeployment -Name "RemoveResources-PipelineApproval"  -ResourceGroupName "fs-sreassets-demo-rg" -TemplateUri $removeResourcesURI -Mode Complete -Force -SkipTemplateParameterPrompt
+- ${{if eq(variables['Build.Reason'],'schedule')}}:
+  - stage:
+    condition: eq(variables['Build.Reason'],'schedule')
+    displayName: 'Destroy AZ Resources by Schedule'
+    jobs:
+    - job: 
+      steps:
+        - checkout: self
+        - task: AzurePowerShell@5
+          displayName: Remove All Resources
+          inputs:
+            azurePowerShellVersion: LatestVersion
+            azureSubscription: 'SRE-ASSETS-DEMO-SC' # string. Alias: connectedServiceNameARM. Required. Azure Resource Manager connection. 
+            ScriptType: InlineScript
+            Inline: |
+                 $removeResourcesURI = "$(Build.SourcesDirectory)/.pipelines/templates/removeallresources.json"
+                 New-AzResourceGroupDeployment -Name "RemoveResources-CronJob"  -ResourceGroupName "fs-sreassets-demo-rg" -TemplateUri $removeResourcesURI -Mode Complete -Force -SkipTemplateParameterPrompt
+                
